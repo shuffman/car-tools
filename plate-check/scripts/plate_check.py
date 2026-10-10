@@ -1,26 +1,25 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.10"
-# dependencies = ["playwright"]
-# ///
+#!/usr/bin/env python3
 """Check Oregon custom (vanity) plate availability on DMV2U.
 
-Drives the real site in headless Google Chrome: one session, walked from the home
-page to Custom Plate Search once, then each plate is filled in, searched and read.
-A bare HTTP POST does not work here -- see SKILL.md for why.
+Talks to the site's own AJAX endpoints over plain HTTPS, no browser: one session,
+walked from the home page to Custom Plate Search once, then each plate is posted
+and the result message read. See SKILL.md for the protocol.
 """
 
 import argparse
+import html as htmllib
+import http.cookiejar
 import json
 import os
 import re
+import secrets
 import sys
+import time
+import urllib.parse
+import urllib.request
 
-from playwright.sync_api import sync_playwright
-
-HOME = "https://dmv2u.oregon.gov/eServices/_/"
+BASE = "https://dmv2u.oregon.gov/eServices/_/"
 POSITIONS = 7
-LIVE_MAIN = "main#MANAGER_CONTROL__0"
 
 TAKEN_MARK = "already taken"
 AVAILABLE_MARK = "You may apply for a custom plate"
@@ -45,75 +44,123 @@ def validate(plate):
     return None
 
 
-def click_until(page, target, expect, tries=4):
-    """Click `target` until `expect` shows up. The home page renders its links
-    before its scripts are wired, so an early click is silently dropped."""
-    for _ in range(tries):
-        target.click()
-        try:
-            expect.wait_for(timeout=5000)
-            return
-        except Exception:
-            pass
-    expect.wait_for(timeout=5000)  # raise with a useful locator in the message
+def page_text(h):
+    h = re.sub(r"<(script|style)\b.*?</\1>", " ", h, flags=re.S)
+    return " ".join(htmllib.unescape(re.sub(r"<[^>]+>", " ", h)).split())
 
 
-def open_search(page):
-    page.goto(HOME, wait_until="networkidle")
-    link = page.get_by_text("Check custom plate availability").first
-    click_until(page, page.get_by_role("link", name="Order a new plate").first, link)
-    click_until(page, link, page.get_by_label("Position 1", exact=True))
+class Session:
+    """One DMV2U session. The server keeps the form state; the client must send
+    back the rolling Fast-Ver-Last token from the previous response, plus a
+    stable window name, on every request."""
+
+    def __init__(self):
+        self.opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+        self.ver_last = None
+        self.ajax_id = 0
+        h = secrets.token_hex(6)
+        self.window = f"FWDC.WND-{h[:4]}-{h[4:8]}-{h[8:]}"
+
+    def _common(self):
+        self.ajax_id += 1
+        return {
+            "FAST_SCRIPT_VER__": "1",
+            "FAST_VERLAST__": self.ver_last,
+            "FAST_VERLAST_SOURCE__": "plate_check",
+            "FAST_CLIENT_WHEN__": str(int(time.time() * 1000)),
+            "FAST_CLIENT_WINDOW__": self.window,
+            "FAST_CLIENT_AJAX_ID__": str(self.ajax_id),
+            "FAST_CLIENT_TRIGGER__": "",
+            "FAST_CLIENT_SOURCE_ID__": "",
+        }
+
+    def _request(self, url, form=None):
+        data = urllib.parse.urlencode(form).encode() if form is not None else None
+        req = urllib.request.Request(url, data=data, headers={
+            "User-Agent": "Mozilla/5.0 (plate_check.py)",
+            "X-Requested-With": "XMLHttpRequest",
+        })
+        with self.opener.open(req, timeout=30) as r:
+            if r.headers.get("Fast-Ver-Last"):
+                self.ver_last = r.headers["Fast-Ver-Last"]
+            return r.read().decode("utf-8")
+
+    def _post(self, endpoint, fields):
+        return json.loads(self._request(BASE + endpoint,
+                                        {**fields, "DOC_MODAL_ID__": "0", **self._common()}))
+
+    def _event(self, event_id, fields=None):
+        r = self._post("EventOccurred", {**(fields or {}), "EVENT__": event_id,
+                                         "TYPE__": "0", "CLOSECONFIRMED__": "false",
+                                         "SCREENWIDTH__": "1200"})
+        if "html" not in r:
+            raise RuntimeError(f"EventOccurred returned no page: {json.dumps(r)[:200]}")
+        return r["html"]
+
+    def open_search(self):
+        home = self._request(BASE)
+        m = re.search(r"setVerLast\('([^']+)'", home)
+        if not m:
+            raise RuntimeError("home page has no setVerLast token")
+        self.ver_last = m[1]
+        load = json.loads(self._request(BASE + "?" + urllib.parse.urlencode(
+            {"Load": "1", **self._common(), "FAST_CLIENT_TRIGGER__": "InitPage"})))
+        page = next(c["manager"] for c in load["contents"] if "manager" in c)
+        page = self._event(link_id(page, "Order a new plate"))
+        self._read_form(self._event(link_id(page, "Check custom plate availability")))
+
+    def _read_form(self, page):
+        """Field and button ids are generated (Dc-c... today), so find them by label."""
+        self.fields = [field_id(page, f"Position {i + 1}") for i in range(POSITIONS)]
+        self.search_button = link_id(page, "Search")
+
+    def check(self, plate):
+        fields = {f: (plate[i] if i < len(plate) else "") for i, f in enumerate(self.fields)}
+        fields["LASTFOCUSFIELD__"] = self.fields[-1]
+        # Recalc is what the browser sends on each keystroke; it is what
+        # enables the Search button on the server's copy of the form.
+        self._post("Recalc", fields)
+        page = self._event(self.search_button, fields)
+        msg = result_message(page)
+        if TAKEN_MARK in msg:
+            return "TAKEN", msg
+        if AVAILABLE_MARK in msg:
+            return "AVAILABLE", msg
+        if os.environ.get("PLATE_DEBUG"):
+            with open(f"/tmp/plate-err-{plate}.html", "w") as fh:
+                fh.write(page)
+        return "UNKNOWN", msg
 
 
-def settled(page):
-    """While re-rendering, the site briefly keeps the outgoing copy of the page
-    as a second <main>, so every field exists twice. Wait for the old one to go
-    and return the live one."""
-    page.wait_for_load_state("networkidle")
-    # Polled from Python: the site's CSP forbids unsafe-eval, which
-    # page.wait_for_function needs.
-    for _ in range(60):
-        if page.locator("main").count() == 1:
-            break
-        page.wait_for_timeout(250)
-    else:
-        raise TimeoutError("page did not settle to one <main> within 15s")
-    return page.locator(LIVE_MAIN)
+def link_id(page, caption):
+    m = re.search(r'data-linkid="([^"]+)"(?:(?!</a>|</button>).)*?>\s*'
+                  + re.escape(caption) + r"\s*<", page, re.S)
+    if not m:
+        raise RuntimeError(f"no link or button captioned {caption!r}")
+    return m[1]
 
 
-def result_message(main):
+def field_id(page, label):
+    m = re.search(r'<label[^>]*\bfor="([^"]+)"[^>]*>(?:(?!</label>).)*?>\s*'
+                  + re.escape(label) + r"\s*<", page, re.S)
+    if not m:
+        raise RuntimeError(f"no field labelled {label!r}")
+    return m[1]
+
+
+def result_message(page):
     """The message sits between the Search button and the page footer."""
-    tail = main.inner_text().rsplit("Search", 1)[-1]
+    tail = page_text(page).rsplit("Search", 1)[-1]
     for stop in ("Click here to get started", "Scroll for More", "Cancel"):
         tail = tail.split(stop, 1)[0]
     return " ".join(tail.split())
 
 
-def check(page, plate):
-    main = settled(page)
-    for i in range(POSITIONS):
-        box = main.get_by_label(f"Position {i + 1}", exact=True)
-        box.fill("")
-        if i < len(plate):
-            box.fill(plate[i])
-    # Each box change posts to /Recalc; let those finish before searching.
-    main = settled(page)
-    with page.expect_response(lambda r: "EventOccurred" in r.url):
-        main.get_by_role("button", name="Search").click()
-    msg = result_message(settled(page))
-    if TAKEN_MARK in msg:
-        return "TAKEN", msg
-    if AVAILABLE_MARK in msg:
-        return "AVAILABLE", msg
-    return "UNKNOWN", msg
-
-
-def attempt(page, plate):
+def attempt(session, plate):
     try:
-        return check(page, plate)
+        return session.check(plate)
     except Exception as e:  # keep going; report the plate as unknown
-        if os.environ.get("PLATE_DEBUG"):
-            page.screenshot(path=f"/tmp/plate-err-{plate}.png", full_page=True)
         return "UNKNOWN", f"error: {e.__class__.__name__}: {str(e).splitlines()[0]}"
 
 
@@ -124,7 +171,6 @@ def main():
     ap.add_argument("--delay", type=float, default=2.0,
                     help="seconds between searches (default 2; be polite to a state site)")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
-    ap.add_argument("--headed", action="store_true", help="show the browser window")
     args = ap.parse_args()
 
     plates = [p.upper() for p in args.plates]
@@ -145,26 +191,22 @@ def main():
             todo.append(p)
 
     if todo:
-        with sync_playwright() as pw:
-            # Installed Chrome, not Playwright's bundled build: no browser download,
-            # and a Playwright upgrade cannot leave the script pointing at a missing binary.
-            browser = pw.chromium.launch(channel="chrome", headless=not args.headed)
-            page = browser.new_page()
-            open_search(page)
-            for n, p in enumerate(todo):
-                if n:
-                    page.wait_for_timeout(args.delay * 1000)
-                status, msg = attempt(page, p)
-                if status == "UNKNOWN":  # one retry from a freshly loaded search page
-                    try:
-                        open_search(page)
-                    except Exception:
-                        pass
-                    status, msg = attempt(page, p)
-                results.append({"plate": p, "status": status, "message": msg})
-                if not args.json:
-                    print_row(results[-1])
-            browser.close()
+        session = Session()
+        session.open_search()
+        for n, p in enumerate(todo):
+            if n:
+                time.sleep(args.delay)
+            status, msg = attempt(session, p)
+            if status == "UNKNOWN":  # one retry from a fresh session
+                try:
+                    session = Session()
+                    session.open_search()
+                except Exception:
+                    pass
+                status, msg = attempt(session, p)
+            results.append({"plate": p, "status": status, "message": msg})
+            if not args.json:
+                print_row(results[-1])
 
     order = {p: i for i, p in enumerate(plates)}
     results.sort(key=lambda r: order[r["plate"]])
